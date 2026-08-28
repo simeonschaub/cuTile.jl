@@ -87,6 +87,33 @@ if ct.tileiras_available()
         @test occursin(r"\.target\s+sm_100", output)
         @test occursin(".text.reflect_vadd", output)
     end
+
+    @testset "GPUCompiler.compile" begin
+        job = ct.tile_job(reflect_vadd, TT3; sm_arch=v"10.0")
+        cubin, meta = ct.GPUCompiler.compile(:obj, job)
+        @test cubin isa Vector{UInt8} && cubin[1:4] == b"\x7fELF"
+        @test meta.entry == "reflect_vadd"
+        ptx, _ = ct.GPUCompiler.compile(:asm, job)
+        @test startswith(ptx, ".version") && occursin(".entry reflect_vadd", ptx)
+        @test ptx == ct.extract_ptx(cubin) == ct.extract_ptx(IOBuffer(cubin))
+        @test_throws "no LLVM stage" ct.GPUCompiler.compile(:llvm, job)
+        @test_throws "Unknown compilation output" ct.GPUCompiler.compile(:wat, job)
+        @test_throws ct.ObjectFile.MagicMismatch ct.extract_ptx(UInt8[0x7f, 0x45, 0x4c, 0x46, 2, 1, 1, 0])
+    end
+
+    @testset "GPUCompiler jobs" begin
+        GC = ct.GPUCompiler
+        job = ct.tile_job(reflect_vadd, TT3; sm_arch=v"10.0")
+        @test job isa ct.TileJob && job.config.name == "reflect_vadd"
+        @test job == ct.tile_job(reflect_vadd, TT3; sm_arch=v"10.0")
+        @test job != ct.tile_job(reflect_vadd, TT3; sm_arch=v"10.0", opt_level=1)
+        @test ct.job_signature(job) == (reflect_vadd, TT3)
+        # GPUCompiler's stage generics dispatch to cuTile's for Tile jobs
+        @test sprint(show, only(GC.code_typed(job))) == sprint(show, only(ct.code_typed(reflect_vadd, TT3)))
+        @test occursin(".entry reflect_vadd", sprint(GC.code_native, job))
+        @test_throws "no LLVM stage" GC.code_llvm(devnull, job)
+        @test GC.get_interpreter(job) isa ct.cuTileInterpreter
+    end
 end
 
 if ct.tileiras_version() >= v"13.4"

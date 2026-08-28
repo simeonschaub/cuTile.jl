@@ -226,6 +226,16 @@ end # invalidations
         String(take!(buf))
     end
 
+    # cuTile jobs reach GPUCompiler's hook, so CUDA's macros work on cuTile launches
+    @test @filecheck begin
+        @check ".entry reflect_vadd"
+        buf = IOBuffer()
+        CUDA.@device_code_ptx io=buf @cuda backend=cuTile blocks=cld(n, 16) reflect_vadd(a, b, c)
+        String(take!(buf))
+    end
+    typed = CUDA.@device_code_typed @cuda backend=cuTile blocks=cld(n, 16) reflect_vadd(a, b, c)
+    @test length(typed) == 1 && only(keys(typed)) isa ct.TileJob
+
     # @device_code_sass has source location annotations
     @test @filecheck begin
         @check "; Location"

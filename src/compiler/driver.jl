@@ -1,12 +1,9 @@
-# Compilation hook for @device_code_* macros - intercepts compilations for reflection
-const compile_hook = Ref{Union{Nothing,Function}}(nothing)
-
 
 #=============================================================================
  Meta nodes and compilation hints
 =============================================================================#
 
-# Compilation options for cache sharding.
+# Codegen options, as consumed by `emit_tile`.
 # Hint fields (opt_level, num_ctas, occupancy, num_worker_warps) represent explicit
 # overrides only; `nothing` means "consult @compiler_options meta nodes in the IR
 # during compilation."
@@ -18,6 +15,66 @@ const CGOpts = @NamedTuple{
     num_worker_warps::Union{Int, Nothing},
     bytecode_version::VersionNumber
 }
+
+#=============================================================================
+ Compiler jobs
+=============================================================================#
+
+struct TileCompilerTarget <: GPUCompiler.AbstractCompilerTarget
+    sm_arch::Union{VersionNumber, Nothing}
+    bytecode_version::VersionNumber
+end
+
+struct TileCompilerParams <: GPUCompiler.AbstractCompilerParams
+    opt_level::Union{Int, Nothing}
+    num_ctas::Union{Int, Nothing}
+    occupancy::Union{Int, Nothing}
+    num_worker_warps::Union{Int, Nothing}
+    # `(Const(f), arg2, …)` for const-seeded inference; a Tuple, not the driver's
+    # Vector, so that jobs compare and hash structurally (`@device_code_*` dedups
+    # by job) and the value is a valid immutable cache token.
+    const_argtypes::Union{Tuple, Nothing}
+end
+
+const TileJob = CompilerJob{TileCompilerTarget, TileCompilerParams}
+
+function tile_job(mi::MethodInstance, world::UInt;
+                  sm_arch::Union{VersionNumber, Nothing}=nothing,
+                  opt_level::Union{Int, Nothing}=nothing,
+                  num_ctas::Union{Int, Nothing}=nothing,
+                  occupancy::Union{Int, Nothing}=nothing,
+                  num_worker_warps::Union{Int, Nothing}=nothing,
+                  bytecode_version::VersionNumber=cuTile.bytecode_version(),
+                  const_argtypes=nothing)
+    target = TileCompilerTarget(sm_arch, bytecode_version)
+    params = TileCompilerParams(opt_level, num_ctas, occupancy, num_worker_warps,
+                                const_argtypes === nothing ? nothing : Tuple(const_argtypes))
+    config = CompilerConfig(target, params; name=sanitize_name(string(mi.def.name)), always_inline=true)
+    return CompilerJob(mi, config, world)
+end
+
+# The job of a cached compilation, from its cache key.
+function tile_job(cache::CacheView, mi::MethodInstance; const_argtypes=nothing)
+    key = cache.owner::TileCacheKey
+    tile_job(mi, cache.world;
+             sm_arch=unpack_version(key.sm_arch), opt_level=unpack_hint(key.opt_level),
+             num_ctas=unpack_hint(key.num_ctas), occupancy=unpack_hint(key.occupancy),
+             num_worker_warps=unpack_hint(key.num_worker_warps),
+             bytecode_version=unpack_version(key.bytecode_version), const_argtypes)
+end
+
+# The job's const-seeded argument types in the driver's `Vector{Any}` form.
+function job_const_argtypes(job::TileJob)
+    cats = job.config.params.const_argtypes
+    cats === nothing ? nothing : collect(Any, cats)
+end
+
+job_opts(job::TileJob) = CGOpts((sm_arch=job.config.target.sm_arch,
+                                 opt_level=job.config.params.opt_level,
+                                 num_ctas=job.config.params.num_ctas,
+                                 occupancy=job.config.params.occupancy,
+                                 num_worker_warps=job.config.params.num_worker_warps,
+                                 bytecode_version=job.config.target.bytecode_version))
 
 """
     process_meta!(ir::CC.IRCode) -> ir
@@ -226,16 +283,14 @@ to resolve them on every phase.
     return (ci, res)
 end
 
-# Cached wrappers around the driver's emit_* functions. These check/populate
-# CuTileResults and are used by the production pipeline (launch → CUDAExt).
-# Reflection APIs (code_tiled, code_structured, etc.) bypass this layer and
-# call the driver directly, so they never pollute the compilation cache.
+# Cached wrappers around the driver's emit_* functions: check/populate
+# CuTileResults. Used by the launch path; reflection calls the driver directly.
 
 """
     emit_structured!(cache, mi, ci, res; const_argtypes=nothing) -> (StructuredIRCode, rettype, kernel_meta)
 
-Cached IR phase. Invokes the compile hook (for `@device_code_*` macros),
-checks `res.julia_ir`, and delegates to `emit_structured` on cache miss.
+Cached IR phase. Checks `res.julia_ir` and delegates to `emit_structured` on
+cache miss.
 
 `ci` and `res` must come from `ensure_compiled(cache, mi, const_argtypes)` —
 i.e. inference is already done. Reflection callers that want the lookup
@@ -245,32 +300,6 @@ overload.
 function emit_structured!(cache::CacheView, mi::Core.MethodInstance,
                           ci::Core.CodeInstance, res::CuTileResults;
                           const_argtypes::Union{Vector{Any}, Nothing}=nothing)
-    # Invoke compile hook if set (for @device_code_* reflection).
-    # Pass (f, tt) tuple to enable direct use with reflection utilities.
-    # Reconstruct Constant{T,V} types from const_argtypes so that code_tiled
-    # can recover const-seeded arguments (MI specTypes have them unwrapped).
-    if compile_hook[] !== nothing
-        ftype = mi.specTypes.parameters[1]
-        f = isdefined(ftype, :instance) ? ftype.instance : ftype
-        arg_types = collect(Any, mi.specTypes.parameters[2:end])
-        if const_argtypes !== nothing
-            # const_argtypes is [Const(f), arg2, ...]; arg_types omits f,
-            # so arg_types[i] corresponds to const_argtypes[i+1].
-            for i in eachindex(arg_types)
-                if const_argtypes[i+1] isa CC.Const
-                    val = const_argtypes[i+1].val
-                    arg_types[i] = typeof(Constant(val))
-                end
-            end
-        end
-        tt = Tuple{arg_types...}
-        # `cufunction` runs the codegen pipeline through `invoke_frozen` (so it
-        # can reuse precompiled native code), but the hook closure was defined
-        # at the user's latest world — invoke it via `invokelatest` so it
-        # dispatches there and not in the frozen world.
-        Base.invokelatest(compile_hook[], f, tt)
-    end
-
     res.julia_ir !== nothing && return res.julia_ir
 
     # Compute fresh via driver
@@ -293,20 +322,15 @@ end
 """
     emit_tile!(cache, mi, ci, res; const_argtypes=nothing) -> Vector{UInt8}
 
-Cached code phase. Delegates to `emit_structured!` for the IR phase, checks
-`res.tile_bc`, and calls the driver's `emit_tile` on cache miss.
+Cached code phase. Checks `res.tile_bc`; on cache miss, takes the IR from
+`emit_structured!` and calls the driver's `emit_tile`.
 """
 function emit_tile!(cache::CacheView, mi::Core.MethodInstance,
                     ci::Core.CodeInstance, res::CuTileResults;
                     const_argtypes::Union{Vector{Any}, Nothing}=nothing)
-    # Delegate to cached IR phase — this also fires `compile_hook` for
-    # `@device_code_*` reflection, which must run on every launch.
-    ir_result = emit_structured!(cache, mi, ci, res; const_argtypes)
-
     res.tile_bc !== nothing && return res.tile_bc
 
-    # Compute bytecode via driver
-    sci, rettype, kernel_meta = ir_result
+    sci, rettype, kernel_meta = emit_structured!(cache, mi, ci, res; const_argtypes)
     key = cache.owner::TileCacheKey
     opts = CGOpts((sm_arch=unpack_version(key.sm_arch),
                    opt_level=unpack_hint(key.opt_level),
